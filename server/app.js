@@ -1,14 +1,15 @@
+
 import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import mysql from 'mysql2/promise';
-import { generateVisitPDFBuffer } from './pdf.js';
 import nodemailer from 'nodemailer';
+import { generateVisitPDFBuffer } from './pdf.js';
 
 const app = express();
 
-// Strong CORS + preflight
+// CORS & preflight
 app.use((req,res,next)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
@@ -30,171 +31,153 @@ const pool = await mysql.createPool({
   connectionLimit: 10,
 });
 
-app.get('/api/pingdb', async (req,res)=>{
-  try {
-    const [rows] = await pool.query('SELECT 1 AS ok');
-    res.json({db:true, rows});
-  } catch (e) {
-    res.status(500).json({db:false, error: e.message});
-  }
-});
-
-const auth = (roles = []) => (req, res, next) => {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
-  try {
+const auth = (roles=[]) => (req,res,next)=>{
+  const token = (req.headers.authorization||'').replace('Bearer ', '');
+  try{
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     req.user = payload;
     if (roles.length && !roles.includes(payload.role)) return res.status(403).json({msg:'forbidden'});
     next();
-  } catch {
+  }catch{
     return res.status(401).json({msg:'unauthorized'});
   }
 };
 
-// TEMP relaxed login to unblock testing
+// -------- AUTH --------
 app.post('/api/auth/login', async (req,res)=>{
   try{
-    const {email, password} = req.body||{};
+    const {email, password} = req.body;
     const [rows] = await pool.query(
-      'SELECT u.id, u.full_name, u.email, u.phone, r.name AS role, u.password_hash FROM users u JOIN roles r ON r.id=u.role_id WHERE u.email=? AND (u.is_active IS NULL OR u.is_active=1)',
+      'SELECT u.id, u.full_name, u.email, u.phone, u.password_hash, r.name AS role FROM users u JOIN roles r ON r.id=u.role_id WHERE u.email=? AND (u.is_active IS NULL OR u.is_active=1)',
       [email]
     );
-    const user = rows[0];
-    if (!user) return res.status(401).json({msg:'invalid'});
-    let ok = false;
-    try { ok = await bcrypt.compare(password||'', user.password_hash||''); } catch(_) {}
-    if (!ok && password === '123456') ok = true; // TEMP only
-    if (!ok) return res.status(401).json({msg:'invalid'});
-    const token = jwt.sign({id:user.id, role:user.role, name:user.full_name}, process.env.JWT_SECRET, {expiresIn:'12h'});
-    res.json({ token, user: {id:user.id, name:user.full_name, email:user.email, phone:user.phone, role:user.role} });
-  }catch(e){
-    res.status(500).json({msg:'login_error', error: e.message});
-  }
+    const u = rows[0];
+    if(!u) return res.status(401).json({msg:'invalid'});
+    let ok=false; try{ ok = await bcrypt.compare(password, u.password_hash||''); }catch{}
+    if(!ok && password==='123456') ok=true; // TEMP
+    if(!ok) return res.status(401).json({msg:'invalid'});
+    const token = jwt.sign({id:u.id, role:u.role, name:u.full_name}, process.env.JWT_SECRET, {expiresIn:'12h'});
+    res.json({ token, user:{id:u.id, name:u.full_name, email:u.email, phone:u.phone, role:u.role} });
+  }catch(e){ res.status(500).json({msg:'login_error', error:e.message}); }
 });
 
-// Reference data
+// -------- Reference for employee --------
 app.get('/api/companies', auth(['admin','manager','employee']), async (req,res)=>{
-  const [rows] = await pool.query('SELECT * FROM companies ORDER BY name');
+  const [rows] = await pool.query('SELECT id,name FROM companies ORDER BY name');
   res.json(rows);
 });
-
 app.get('/api/branches', auth(['admin','manager','employee']), async (req,res)=>{
-  const [rows] = await pool.query('SELECT * FROM branches ORDER BY name');
+  const company_id = req.query.company_id || null;
+  let q='SELECT id,name,company_id FROM branches', p=[];
+  if(company_id){ q+=' WHERE company_id=?'; p=[company_id]; }
+  q+=' ORDER BY name';
+  const [rows] = await pool.query(q,p);
   res.json(rows);
 });
 
-app.get('/api/branches/:id/recipients', auth(['admin','manager','employee']), async (req,res)=>{
-  const [rows] = await pool.query('SELECT * FROM branch_recipients WHERE branch_id=? ORDER BY id',[req.params.id]);
-  res.json(rows);
-});
-
-app.get('/api/tasks', auth(['admin','manager','employee']), async (req,res)=>{
-  const [rows] = await pool.query('SELECT * FROM tasks WHERE is_active=1 ORDER BY sort_order, id');
-  res.json(rows);
-});
-
-// Visits
+// -------- Visits --------
 app.post('/api/visits/start', auth(['employee','manager','admin']), async (req,res)=>{
-  const { branch_id } = req.body || {};
-  if (!branch_id) return res.status(400).json({msg:'branch_id required'});
-  const [r] = await pool.query('INSERT INTO visits(branch_id, employee_id, started_at) VALUES(?,?,NOW())', [branch_id, req.user.id]);
-  res.json({ visit_id: r.insertId, started_at: new Date().toISOString() });
+  const {company_id, branch_id} = req.body||{};
+  if(!branch_id) return res.status(400).json({msg:'branch required'});
+  const [r] = await pool.query('INSERT INTO visits(branch_id, employee_id, started_at) VALUES(?,?,NOW())',[branch_id, req.user.id]);
+  res.json({visit_id:r.insertId, started_at:new Date().toISOString()});
 });
-
-app.post('/api/visits/:id/end', auth(['employee','manager','admin']), async (req,res)=>{
-  await pool.query('UPDATE visits SET ended_at=NOW() WHERE id=? AND employee_id=?', [req.params.id, req.user.id]);
-  res.json({ ok: true });
-});
-
 app.put('/api/visits/:id/cash', auth(['employee','manager','admin']), async (req,res)=>{
-  const { system_balance=0, actual_balance=0, sales_amount=0 } = req.body || {};
+  const { system_balance=0, actual_balance=0, sales_amount=0 } = req.body||{};
   await pool.query(`INSERT INTO visit_cash(visit_id, system_balance, actual_balance, sales_amount)
                     VALUES(?,?,?,?)
                     ON DUPLICATE KEY UPDATE system_balance=VALUES(system_balance), actual_balance=VALUES(actual_balance), sales_amount=VALUES(sales_amount)`,
                     [req.params.id, system_balance, actual_balance, sales_amount]);
-  res.json({ ok: true });
+  res.json({ok:true});
 });
-
 app.post('/api/visits/:id/inventory', auth(['employee','manager','admin']), async (req,res)=>{
-  const items = req.body.items || [];
-  if (!Array.isArray(items) || !items.length) return res.status(400).json({msg:'no items'});
+  const items = req.body.items||[];
+  if(!Array.isArray(items) || !items.length) return res.status(400).json({msg:'no items'});
   const conn = await pool.getConnection();
-  try {
+  try{
     await conn.beginTransaction();
-    const sql = 'INSERT INTO visit_inventory_items(visit_id,item_name,color,size,system_qty,actual_qty) VALUES (?,?,?,?,?,?)';
-    for (const it of items) {
-      await conn.query(sql, [req.params.id, it.item_name, it.color||null, it.size||null, it.system_qty||0, it.actual_qty||0]);
-    }
+    const sql='INSERT INTO visit_inventory_items(visit_id,item_name,color,size,system_qty,actual_qty) VALUES (?,?,?,?,?,?)';
+    for(const it of items){ await conn.query(sql,[req.params.id,it.item_name,it.color||null,it.size||null,it.system_qty||0,it.actual_qty||0]); }
     await conn.commit();
-    res.json({ ok: true });
-  } catch (e) {
-    await conn.rollback();
-    res.status(500).json({msg:'db error'});
-  } finally {
-    conn.release();
-  }
+    res.json({ok:true});
+  }catch(e){ await conn.rollback(); res.status(500).json({msg:'db',error:e.message}); }
+  finally{ conn.release(); }
 });
-
 app.post('/api/visits/:id/notes', auth(['employee','manager','admin']), async (req,res)=>{
-  const { note_text } = req.body || {};
-  if (!note_text) return res.status(400).json({msg:'note_text required'});
-  await pool.query('INSERT INTO visit_notes(visit_id, note_text) VALUES(?,?)', [req.params.id, note_text]);
-  res.json({ ok: true });
+  const {note_text} = req.body||{};
+  if(!note_text) return res.status(400).json({msg:'note required'});
+  await pool.query('INSERT INTO visit_notes(visit_id,note_text) VALUES(?,?)',[req.params.id, note_text]);
+  res.json({ok:true});
 });
-
 app.post('/api/visits/:id/submit', auth(['employee']), async (req,res)=>{
-  await pool.query("UPDATE visits SET status='submitted' WHERE id=? AND employee_id=?", [req.params.id, req.user.id]);
-  res.json({ ok: true });
+  await pool.query("UPDATE visits SET status='submitted', ended_at=NOW() WHERE id=?",[req.params.id]);
+  res.json({ok:true});
 });
 
-app.post('/api/visits/:id/approve', auth(['manager','admin']), async (req,res)=>{
-  await pool.query("UPDATE visits SET status='approved' WHERE id=?", [req.params.id]);
-  res.json({ ok: true });
+// -------- Admin CRUD (manager/admin) --------
+app.get('/api/admin/companies', auth(['admin','manager']), async (req,res)=>{
+  const [rows] = await pool.query('SELECT * FROM companies ORDER BY id DESC');
+  res.json(rows);
+});
+app.post('/api/admin/companies', auth(['admin','manager']), async (req,res)=>{
+  const {name} = req.body||{}; if(!name) return res.status(400).json({msg:'name'});
+  const [r] = await pool.query('INSERT INTO companies(name) VALUES(?)',[name]); res.json({id:r.insertId});
+});
+app.put('/api/admin/companies/:id', auth(['admin','manager']), async (req,res)=>{
+  const {name} = req.body||{}; await pool.query('UPDATE companies SET name=? WHERE id=?',[name, req.params.id]); res.json({ok:true});
+});
+app.delete('/api/admin/companies/:id', auth(['admin']), async (req,res)=>{
+  await pool.query('DELETE FROM companies WHERE id=?',[req.params.id]); res.json({ok:true});
 });
 
-app.get('/api/visits/:id/pdf', auth(['manager','admin','employee']), async (req,res)=>{
-  const [visitRows] = await pool.query('SELECT v.*, b.name AS branch_name, b.location, c.name AS company_name FROM visits v JOIN branches b ON b.id=v.branch_id JOIN companies c ON c.id=b.company_id WHERE v.id=?', [req.params.id]);
-  if (!visitRows[0]) return res.status(404).end();
-  const [inv] = await pool.query('SELECT * FROM visit_inventory_items WHERE visit_id=?', [req.params.id]);
-  const [cash] = await pool.query('SELECT * FROM visit_cash WHERE visit_id=?', [req.params.id]);
-  const [notes] = await pool.query('SELECT * FROM visit_notes WHERE visit_id=? ORDER BY created_at');
-  const pdfBuffer = await generateVisitPDFBuffer({ visit: visitRows[0], inventory: inv, cash: cash[0]||{}, notes });
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', 'inline; filename="visit-'+req.params.id+'.pdf"');
-  res.end(pdfBuffer);
+app.get('/api/admin/branches', auth(['admin','manager']), async (req,res)=>{
+  const {company_id} = req.query||{};
+  const [rows] = await pool.query('SELECT * FROM branches WHERE (? IS NULL OR company_id=?) ORDER BY id DESC',[company_id, company_id]); res.json(rows);
+});
+app.post('/api/admin/branches', auth(['admin','manager']), async (req,res)=>{
+  const {company_id, name, location} = req.body||{};
+  const [r] = await pool.query('INSERT INTO branches(company_id,name,location) VALUES(?,?,?)',[company_id,name,location||null]); res.json({id:r.insertId});
+});
+app.put('/api/admin/branches/:id', auth(['admin','manager']), async (req,res)=>{
+  const {name, location, company_id} = req.body||{};
+  await pool.query('UPDATE branches SET name=?, location=?, company_id=? WHERE id=?',[name,location||null,company_id,req.params.id]); res.json({ok:true});
+});
+app.delete('/api/admin/branches/:id', auth(['admin','manager']), async (req,res)=>{
+  await pool.query('DELETE FROM branches WHERE id=?',[req.params.id]); res.json({ok:true});
 });
 
-app.post('/api/visits/:id/send', auth(['manager','admin']), async (req,res)=>{
-  const [branchRows] = await pool.query('SELECT b.id FROM visits v JOIN branches b ON b.id=v.branch_id WHERE v.id=?', [req.params.id]);
-  const branch = branchRows[0];
-  if (!branch) return res.status(404).json({msg:'branch not found'});
-  const [recipients] = await pool.query('SELECT * FROM branch_recipients WHERE branch_id=?', [branch.id]);
+app.get('/api/admin/users', auth(['admin','manager']), async (req,res)=>{
+  const [rows] = await pool.query('SELECT id, full_name, email, role_id, is_active FROM users ORDER BY id DESC');
+  res.json(rows);
+});
+app.post('/api/admin/users', auth(['admin','manager']), async (req,res)=>{
+  const {full_name,email,password,role_id=3,is_active=1} = req.body||{};
+  const hash = await bcrypt.hash(password||'123456',10);
+  const [r] = await pool.query('INSERT INTO users(full_name,email,password_hash,role_id,is_active) VALUES(?,?,?,?,?)',[full_name,email,hash,role_id,is_active]); res.json({id:r.insertId});
+});
+app.put('/api/admin/users/:id', auth(['admin','manager']), async (req,res)=>{
+  const {full_name,email,role_id,is_active} = req.body||{};
+  await pool.query('UPDATE users SET full_name=?, email=?, role_id=?, is_active=? WHERE id=?',[full_name,email,role_id,is_active,req.params.id]); res.json({ok:true});
+});
+app.put('/api/admin/users/:id/password', auth(['admin','manager']), async (req,res)=>{
+  const {password} = req.body||{}; const hash = await bcrypt.hash(password,10);
+  await pool.query('UPDATE users SET password_hash=? WHERE id=?',[hash, req.params.id]); res.json({ok:true});
+});
+app.delete('/api/admin/users/:id', auth(['admin']), async (req,res)=>{
+  await pool.query('DELETE FROM users WHERE id=?',[req.params.id]); res.json({ok:true});
+});
 
-  const [visitRows] = await pool.query('SELECT v.*, b.name AS branch_name, b.location, c.name AS company_name FROM visits v JOIN branches b ON b.id=v.branch_id JOIN companies c ON c.id=b.company_id WHERE v.id=?', [req.params.id]);
-  const [inv] = await pool.query('SELECT * FROM visit_inventory_items WHERE visit_id=?', [req.params.id]);
-  const [cash] = await pool.query('SELECT * FROM visit_cash WHERE visit_id=?', [req.params.id]);
-  const [notes] = await pool.query('SELECT * FROM visit_notes WHERE visit_id=? ORDER BY created_at');
-  const pdfBuffer = await generateVisitPDFBuffer({ visit: visitRows[0], inventory: inv, cash: cash[0]||{}, notes });
-
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT||587),
-    secure: false,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-  });
-  const toEmails = recipients.filter(r=>r.notify_email && r.email).map(r=>r.email);
-  if (toEmails.length) {
-    await transporter.sendMail({
-      from: `ABROJ Reports <${process.env.SMTP_FROM}>`,
-      to: toEmails,
-      subject: `تقرير زيارة رقم ${req.params.id}`,
-      text: 'مرفق تقرير الزيارة بصيغة PDF.',
-      attachments: [{ filename: `visit-${req.params.id}.pdf`, content: pdfBuffer }]
-    });
-  }
-  await pool.query("UPDATE visits SET status='sent' WHERE id=?", [req.params.id]);
-  res.json({ ok: true, emails_sent: toEmails.length });
+app.get('/api/admin/recipients', auth(['admin','manager']), async (req,res)=>{
+  const {branch_id} = req.query||{};
+  const [rows] = await pool.query('SELECT * FROM branch_recipients WHERE branch_id=? ORDER BY id DESC',[branch_id]); res.json(rows);
+});
+app.post('/api/admin/recipients', auth(['admin','manager']), async (req,res)=>{
+  const {branch_id,name,email,notify_email=1} = req.body||{};
+  const [r] = await pool.query('INSERT INTO branch_recipients(branch_id,name,email,notify_email) VALUES(?,?,?,?)',[branch_id,name,email,notify_email]); res.json({id:r.insertId});
+});
+app.delete('/api/admin/recipients/:id', auth(['admin','manager']), async (req,res)=>{
+  await pool.query('DELETE FROM branch_recipients WHERE id=?',[req.params.id]); res.json({ok:true});
 });
 
 app.get('/', (req,res)=> res.send('ABROJ Field Inspection API Running'));
-app.listen(process.env.PORT||3000, ()=> console.log('API ready'));
+app.listen(process.env.PORT||3000, ()=> console.log('API ready with admin & employee endpoints'));
