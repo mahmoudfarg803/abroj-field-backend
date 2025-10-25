@@ -7,9 +7,22 @@ import { generateVisitPDFBuffer } from './pdf.js';
 import nodemailer from 'nodemailer';
 
 const app = express();
+
+// --- Strong CORS (explicit) ---
+app.use((req,res,next)=>{
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 app.use(cors());
 app.use(express.json());
 
+// Health
+app.get('/api/health', (req,res)=> res.json({ok:true, ts: Date.now()}));
+
+// DB pool
 const pool = await mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -17,6 +30,16 @@ const pool = await mysql.createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
+});
+
+// Simple DB ping
+app.get('/api/pingdb', async (req,res)=>{
+  try {
+    const [rows] = await pool.query('SELECT 1 AS ok');
+    res.json({db:true, rows});
+  } catch (e) {
+    res.status(500).json({db:false, error: e.message});
+  }
 });
 
 const auth = (roles = []) => (req, res, next) => {
@@ -31,21 +54,23 @@ const auth = (roles = []) => (req, res, next) => {
   }
 };
 
-app.get('/api/health', (req,res)=> res.json({ok:true}));
-
 // Login
 app.post('/api/auth/login', async (req,res)=>{
-  const {email, password} = req.body;
-  const [rows] = await pool.query(
-    'SELECT u.id, u.full_name, u.email, u.phone, r.name AS role, u.password_hash FROM users u JOIN roles r ON r.id=u.role_id WHERE email=? AND is_active=1',
-    [email]
-  );
-  const user = rows[0];
-  if (!user) return res.status(401).json({msg:'invalid'});
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({msg:'invalid'});
-  const token = jwt.sign({id:user.id, role:user.role, name:user.full_name}, process.env.JWT_SECRET, {expiresIn:'12h'});
-  res.json({ token, user: {id:user.id, name:user.full_name, email:user.email, phone:user.phone, role:user.role} });
+  try{
+    const {email, password} = req.body||{};
+    const [rows] = await pool.query(
+      'SELECT u.id, u.full_name, u.email, u.phone, r.name AS role, u.password_hash FROM users u JOIN roles r ON r.id=u.role_id WHERE email=? AND is_active=1',
+      [email]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({msg:'invalid'});
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({msg:'invalid'});
+    const token = jwt.sign({id:user.id, role:user.role, name:user.full_name}, process.env.JWT_SECRET, {expiresIn:'12h'});
+    res.json({ token, user: {id:user.id, name:user.full_name, email:user.email, phone:user.phone, role:user.role} });
+  }catch(e){
+    res.status(500).json({msg:'login_error', error: e.message});
+  }
 });
 
 // Companies/Branches/Recipients
@@ -72,7 +97,7 @@ app.get('/api/tasks', auth(['admin','manager','employee']), async (req,res)=>{
 
 // Visits
 app.post('/api/visits/start', auth(['employee','manager','admin']), async (req,res)=>{
-  const { branch_id } = req.body;
+  const { branch_id } = req.body || {};
   if (!branch_id) return res.status(400).json({msg:'branch_id required'});
   const [r] = await pool.query('INSERT INTO visits(branch_id, employee_id, started_at) VALUES(?,?,NOW())', [branch_id, req.user.id]);
   res.json({ visit_id: r.insertId, started_at: new Date().toISOString() });
@@ -173,4 +198,7 @@ app.post('/api/visits/:id/send', auth(['manager','admin']), async (req,res)=>{
   res.json({ ok: true, emails_sent: toEmails.length });
 });
 
-app.listen(process.env.PORT||3000, ()=> console.log('API up'));
+// Root
+app.get('/', (req,res)=> res.send('ABROJ Field Inspection API Running'));
+
+app.listen(process.env.PORT||3000, ()=> console.log('API ready'));
